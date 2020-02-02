@@ -51,9 +51,30 @@ namespace lspc
 		typedef enum MessageTypesToPC: uint8_t
 		{
 			Test = 0x01,
+			Sensors = 0x02,
 			CPUload = 0xE1,
 			Debug = 0xFF
 		} MessageTypesToPC_t;
+
+		typedef struct
+		{
+			float timestamp;
+			struct encoders_t
+			{
+				int32_t front;
+				int32_t back;
+			} encoders;
+			struct rc_t
+			{
+				float throttle;
+				float steering;
+			} rc;
+			struct motors_t
+			{
+				float throttle;
+				float steering;
+			} motors;
+		} Sensors_t;
 	}
 
 } // namespace lspc

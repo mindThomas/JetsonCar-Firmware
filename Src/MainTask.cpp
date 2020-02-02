@@ -52,6 +52,7 @@
 //#include "LQR.h"
 //#include "SlidingMode.h"
 #include "Debug.h"
+#include "CPULoad.h"
 //#include "COMEKF.h"
 //#include "MadgwickAHRS.h"
 //#include "QEKF.h"
@@ -85,8 +86,8 @@ void EnterBootloader_Callback(void * param, const std::vector<uint8_t>& payload)
 int32_t encoderFront = 0;
 int32_t encoderBack = 0;
 
-float throttle = 0;
-float steering = 0;
+float throttle_in = 0;
+float steering_in = 0;
 
 void MainTask(void * pvParameters)
 {
@@ -105,12 +106,13 @@ void MainTask(void * pvParameters)
 	USBCDC * usb = new USBCDC(USBCDC_TRANSMITTER_PRIORITY);
 	LSPC * lspcUSB = new LSPC(usb, LSPC_RECEIVER_PRIORITY, LSPC_TRANSMITTER_PRIORITY); // very important to use "new", otherwise the object gets placed on the stack which does not have enough memory!
 	Debug::AssignDebugCOM(lspcUSB); // pair debug module with configured LSPC module to enable "Debug::print" functionality
+	CPULoad * cpuLoad = new CPULoad(*lspcUSB, CPULOAD_PRIORITY);
 
 	/* Initialize hardware periphirals */
 	RCReceiver * rc_throttle = new RCReceiver(InputCapture::TIMER4, InputCapture::CH3);
 	RCReceiver * rc_steering = new RCReceiver(InputCapture::TIMER4, InputCapture::CH4);
 	Servo * throttle = new Servo(PWM::TIMER1, PWM::CH1);
-	Servo * servo_rear = new Servo(PWM::TIMER9, PWM::CH1);
+	Servo * servo_front = new Servo(PWM::TIMER9, PWM::CH1);
 	Encoder * encoder_front = new Encoder(Encoder::TIMER5);
 	Encoder * encoder_back = new Encoder(Encoder::TIMER2, true);
 	IO * buzzer = new IO(GPIOA, GPIO_PIN_4);
@@ -126,47 +128,49 @@ void MainTask(void * pvParameters)
 	Timer * microsTimer = new Timer(Timer::TIMER11, 1000000); // create a 1 MHz counting timer used for micros() timing
 
 	/* Initialize modules */
-	SpeedController * controller = new SpeedController(lspcUSB, *microsTimer, *throttle, *encoder_front, SPEED_CONTROLLER_PRIORITY);
+	/*SpeedController * controller = new SpeedController(lspcUSB, *microsTimer, *throttle, *encoder_back, 480, SPEED_CONTROLLER_PRIORITY);  // 12 ticks pr. encoder/motor rev,  gearing ratio of 40  =  480 ticks pr. rev
 	controller->Enable();
-	controller->SetSpeed(0.5);
+	controller->SetSpeed(5);
+	servo_front->Set(0.0f);*/
+
+	throttle->Disable();
+	osDelay(100);
+	throttle->Set(0);
+	osDelay(100);
+	throttle->Disable();
+	osDelay(100);
+	throttle->Set(0);
+	osDelay(1000);
+
 
 	/******* APPLICATION LAYERS *******/
 	LightAndSoundHandler * LightAndSound = new LightAndSoundHandler(*red, *green, *blue, *buzzer);
 	if (!LightAndSound) ERROR("Could not initialize light and sound handler");
 
-
-	/* Send CPU load every second */
-	char * pcWriteBuffer = (char *)pvPortMalloc(1024);
 	while (1)
 	{
-		vTaskGetRunTimeStats(pcWriteBuffer);
-		char * endPtr = &pcWriteBuffer[strlen(pcWriteBuffer)];
-		*endPtr++ = '\n'; *endPtr++ = '\n'; *endPtr++ = 0;
+		encoderFront = encoder_front->Get();
+		encoderBack = encoder_back->Get();
 
-		// Split into multiple packages and send
-		uint16_t txIdx = 0;
-		uint16_t remainingLength = strlen(pcWriteBuffer);
-		uint16_t txLength;
+		throttle_in = rc_throttle->Get();
+		steering_in = rc_steering->Get();
 
-		while (remainingLength > 0) {
-			txLength = remainingLength;
-			if (txLength > LSPC_MAXIMUM_PACKAGE_LENGTH) {
-				txLength = LSPC_MAXIMUM_PACKAGE_LENGTH-1;
-				while (pcWriteBuffer[txIdx+txLength] != '\n' && txLength > 0) txLength--; // find and include line-break (if possible)
-				if (txLength == 0) txLength = LSPC_MAXIMUM_PACKAGE_LENGTH;
-				else txLength++;
-			}
-			lspcUSB->TransmitAsync(lspc::MessageTypesToPC::CPUload, (uint8_t *)&pcWriteBuffer[txIdx], txLength);
+		throttle->Set(throttle_in);
+		//controller->SetSpeed(10*throttle_in);
+		servo_front->Set(steering_in);
 
-			txIdx += txLength;
-			remainingLength -= txLength;
-		}
-		osDelay(1000);
-	}
+		lspc::MessageTypesToPC::Sensors_t msg;
+		msg.timestamp = microsTimer->GetTime();
+		msg.encoders.front = encoderFront;
+		msg.encoders.back = encoderBack;
+		msg.rc.throttle = throttle_in;
+		msg.rc.steering = steering_in;
+		msg.motors.throttle = throttle_in;
+		msg.motors.steering = steering_in;
+		lspcUSB->TransmitAsync(lspc::MessageTypesToPC::Sensors, (uint8_t *)&msg, sizeof(msg));
 
-	while (1)
-	{
-		vTaskSuspend(NULL); // suspend this task
+		osDelay(10);
+		//vTaskSuspend(NULL); // suspend this task
 	}
 }
 
