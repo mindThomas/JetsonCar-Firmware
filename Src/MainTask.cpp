@@ -165,8 +165,8 @@ void MainTask(void * pvParameters)
 		msg.encoders.back = encoderBack;
 		msg.rc.throttle = throttle_in;
 		msg.rc.steering = steering_in;
-		msg.motors.throttle = throttle_in;
-		msg.motors.steering = steering_in;
+		msg.motors.throttle = float(int16_t(1024*throttle_in)) / 1024.f;
+		msg.motors.steering = float(int16_t(1024*steering_in)) / 1024.f;
 		lspcUSB->TransmitAsync(lspc::MessageTypesToPC::Sensors, (uint8_t *)&msg, sizeof(msg));
 
 		osDelay(10);
