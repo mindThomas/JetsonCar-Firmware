@@ -147,6 +147,12 @@ void MainTask(void * pvParameters)
 	LightAndSoundHandler * LightAndSound = new LightAndSoundHandler(*red, *green, *blue, *buzzer);
 	if (!LightAndSound) ERROR("Could not initialize light and sound handler");
 
+
+	bool EnableTest = false;
+	float SpeedValue = 0.0f;
+	bool Up_nDown = true;
+	uint16_t stepWait = 0;
+
 	while (1)
 	{
 		encoderFront = encoder_front->Get();
@@ -155,9 +161,39 @@ void MainTask(void * pvParameters)
 		throttle_in = rc_throttle->Get();
 		steering_in = rc_steering->Get();
 
-		throttle->Set(throttle_in);
+		if (steering_in < -0.7)
+			EnableTest = true;
+		else if (steering_in > 0.7) {
+			EnableTest = false;
+			SpeedValue = 0;
+		}
+
+		if (EnableTest) {
+			stepWait++;
+
+			if ((stepWait % 40) == 0) { // 40x50 = 2000 ms
+				stepWait = 0;
+
+				if (Up_nDown) {
+					SpeedValue += 0.05f;
+					if (SpeedValue >= 0.79f)
+						Up_nDown = false;
+				}
+				else
+				{
+					SpeedValue -= 0.05f;
+					if (SpeedValue <= -0.79f)
+						Up_nDown = true;
+				}
+			}
+		} else {
+			SpeedValue = throttle_in;
+		}
+
+		throttle->Set(SpeedValue);
 		//controller->SetSpeed(10*throttle_in);
 		servo_front->Set(steering_in);
+
 
 		lspc::MessageTypesToPC::Sensors_t msg;
 		msg.timestamp = microsTimer->GetTime();
@@ -165,11 +201,11 @@ void MainTask(void * pvParameters)
 		msg.encoders.back = encoderBack;
 		msg.rc.throttle = throttle_in;
 		msg.rc.steering = steering_in;
-		msg.motors.throttle = float(int16_t(1024*throttle_in)) / 1024.f;
+		msg.motors.throttle = float(int16_t(1024*SpeedValue)) / 1024.f;
 		msg.motors.steering = float(int16_t(1024*steering_in)) / 1024.f;
 		lspcUSB->TransmitAsync(lspc::MessageTypesToPC::Sensors, (uint8_t *)&msg, sizeof(msg));
 
-		osDelay(10);
+		osDelay(50);
 		//vTaskSuspend(NULL); // suspend this task
 	}
 }
