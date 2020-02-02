@@ -103,7 +103,7 @@ void MainTask(void * pvParameters)
 	 */
 
 	/* Initialize communication */
-	USBCDC * usb = new USBCDC(USBCDC_TRANSMITTER_PRIORITY);
+	USBCDC * usb = new USBCDC(USBCDC_TRANSMITTER_PRIORITY, "JetsonCar Serial Port", 0x5544);
 	LSPC * lspcUSB = new LSPC(usb, LSPC_RECEIVER_PRIORITY, LSPC_TRANSMITTER_PRIORITY); // very important to use "new", otherwise the object gets placed on the stack which does not have enough memory!
 	Debug::AssignDebugCOM(lspcUSB); // pair debug module with configured LSPC module to enable "Debug::print" functionality
 	CPULoad * cpuLoad = new CPULoad(*lspcUSB, CPULOAD_PRIORITY);
