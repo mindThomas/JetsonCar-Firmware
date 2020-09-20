@@ -30,10 +30,25 @@ namespace lspc
 		typedef enum MessageTypesFromPC: uint8_t
 		{
 			Test = 0x01,
+			SetPID = 0x02,
+			Setpoint = 0x03,
 			EnterBootloader = 0xF0,
 			Reboot = 0xF1,
 			Debug = 0xFF
 		} MessageTypesFromPC_t;
+
+		typedef struct
+		{
+			float P;
+			float I;
+			float D;
+		} SetPID_t;
+
+		typedef struct
+		{
+			float angular_velocity;
+			float steering;
+		} Setpoint_t;
 
 		typedef struct
 		{
@@ -59,21 +74,31 @@ namespace lspc
 		typedef struct
 		{
 			float timestamp;
-			struct encoders_t
+			struct wheel_angles_t
 			{
-				int32_t front;
-				int32_t back;
-			} encoders;
+				float front;
+				float rear;
+			} wheel_angles;
+			struct wheel_angular_velocities_t
+			{
+				float front;
+				float rear;
+			} wheel_angular_velocities;
 			struct rc_t
 			{
 				float throttle;
 				float steering;
 			} rc;
-			struct motors_t
+			struct setpoints_t
+			{
+				float angular_velocity;
+				float steering;
+			} setpoints;
+			struct motor_outputs_t
 			{
 				float throttle;
 				float steering;
-			} motors;
+			} motor_outputs;
 		} Sensors_t;
 	}
 

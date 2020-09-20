@@ -20,6 +20,7 @@
 #include "cmsis_os.h"
 #include "Priorities.h"
 #include "ProcessorInit.h"
+#include "Parameters.h"
 
 /* Include Periphiral drivers */
 //#include "ADC.h"
@@ -70,6 +71,9 @@
 //#include "PathFollowingController.h"
 //#include "ApplicationTemplate.h"
 
+/* Include Misc libraries */
+#include "RateLimiter.hpp"
+
 /* Miscellaneous includes */
 #include <stdarg.h>
 #include <stdio.h>
@@ -78,16 +82,31 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cmath>
 
 void jetColor(const float v, const float vmin, const float vmax, float RGB[3]);
 void Reboot_Callback(void * param, const std::vector<uint8_t>& payload);
 void EnterBootloader_Callback(void * param, const std::vector<uint8_t>& payload);
+void SetPID_Callback(void * param, const std::vector<uint8_t>& payload);
+void Setpoint_Callback(void * param, const std::vector<uint8_t>& payload);
 
 int32_t encoderFront = 0;
 int32_t encoderBack = 0;
 
 float throttle_in = 0;
 float steering_in = 0;
+
+typedef struct {
+	SemaphoreHandle_t semaphore = NULL;
+	uint32_t timestamp = 0;
+	enum {
+		MANUAL,
+		AUTO
+	} mode = MANUAL;
+	lspc::MessageTypesFromPC::Setpoint_t setpoint = {.angular_velocity = 0, .steering = 0};
+} ControllerSetpoint_t;
+
+#define MOTOR_SYSID	 false
 
 void MainTask(void * pvParameters)
 {
@@ -112,7 +131,7 @@ void MainTask(void * pvParameters)
 	RCReceiver * rc_throttle = new RCReceiver(InputCapture::TIMER4, InputCapture::CH3);
 	RCReceiver * rc_steering = new RCReceiver(InputCapture::TIMER4, InputCapture::CH4);
 	Servo * throttle = new Servo(PWM::TIMER1, PWM::CH1);
-	Servo * servo_front = new Servo(PWM::TIMER9, PWM::CH1);
+	Servo * servo_front = new Servo(PWM::TIMER9, PWM::CH1, -1.0f, 1.0f, 1.2f, 1.8f);
 	Encoder * encoder_front = new Encoder(Encoder::TIMER5);
 	Encoder * encoder_back = new Encoder(Encoder::TIMER2, true);
 	IO * buzzer = new IO(GPIOA, GPIO_PIN_4);
@@ -127,12 +146,19 @@ void MainTask(void * pvParameters)
 	/* Initialize microseconds timer */
 	Timer * microsTimer = new Timer(Timer::TIMER11, 1000000); // create a 1 MHz counting timer used for micros() timing
 
-	/* Initialize modules */
-	/*SpeedController * controller = new SpeedController(lspcUSB, *microsTimer, *throttle, *encoder_back, 480, SPEED_CONTROLLER_PRIORITY);  // 12 ticks pr. encoder/motor rev,  gearing ratio of 40  =  480 ticks pr. rev
-	controller->Enable();
-	controller->SetSpeed(5);
-	servo_front->Set(0.0f);*/
+	/* Create setpoint semaphores */
+	ControllerSetpoint_t ControllerSetpoint;
+	ControllerSetpoint.semaphore = xSemaphoreCreateBinary();
+	if (ControllerSetpoint.semaphore == NULL) {
+		ERROR("Could not create reference semaphore");
+		return;
+	}
+	vQueueAddToRegistry(ControllerSetpoint.semaphore, "Reference");
+	xSemaphoreGive( ControllerSetpoint.semaphore ); // give the semaphore the first time
+	lspcUSB->registerCallback(lspc::MessageTypesFromPC::Setpoint, &Setpoint_Callback, (void *)&ControllerSetpoint);
 
+	/* Initialize modules */
+#if MOTOR_SYSID
 	throttle->Disable();
 	osDelay(100);
 	throttle->Set(0);
@@ -141,26 +167,96 @@ void MainTask(void * pvParameters)
 	osDelay(100);
 	throttle->Set(0);
 	osDelay(1000);
+#else
+	struct {
+		float a = 21.9663f;
+		float b = 5.9356f;
+		float c = 0.2154f;
+	} feedforward_params;
+	SpeedController * controller = new SpeedController(lspcUSB, *microsTimer, *throttle, *encoder_back, ENCODER_TICKS_REV * GEAR_RATIO,
+			[feedforward_params](float setpoint)->float{
+				return copysignf(1.f, setpoint) * (feedforward_params.c - logf(1.f - fabs(setpoint) / feedforward_params.a) / feedforward_params.b);
+			},
+			SPEED_CONTROLLER_PRIORITY);  // 12 ticks pr. encoder/motor rev,  gearing ratio of 40  =  480 ticks pr. rev
+	RateLimiter rateLimit(0.05f, 15.0f, 25.0f);
+	lspcUSB->registerCallback(lspc::MessageTypesFromPC::SetPID, &SetPID_Callback, (void *)controller);
 
+	controller->Enable();
+	controller->SetSpeed(5);
+	servo_front->Set(0.0f);
+#endif
 
 	/******* APPLICATION LAYERS *******/
-	LightAndSoundHandler * LightAndSound = new LightAndSoundHandler(*red, *green, *blue, *buzzer);
-	if (!LightAndSound) ERROR("Could not initialize light and sound handler");
+	//LightAndSoundHandler * LightAndSound = new LightAndSoundHandler(*red, *green, *blue, *buzzer);
+	//if (!LightAndSound) ERROR("Could not initialize light and sound handler");
 
 
 	bool EnableTest = false;
 	float SpeedValue = 0.0f;
 	bool Up_nDown = true;
 	uint16_t stepWait = 0;
+	ControllerSetpoint_t ControllerSetpointLocal;
+	bool RC_Active = false;
+
+	xSemaphoreTake( ControllerSetpoint.semaphore, ( TickType_t ) portMAX_DELAY); // lock for reading
+	ControllerSetpointLocal.setpoint = ControllerSetpoint.setpoint;
+	xSemaphoreGive( ControllerSetpoint.semaphore ); // give semaphore back
 
 	while (1)
 	{
 		encoderFront = encoder_front->Get();
 		encoderBack = encoder_back->Get();
 
-		throttle_in = rc_throttle->Get();
-		steering_in = rc_steering->Get();
+		if (xSemaphoreTake( ControllerSetpoint.semaphore, ( TickType_t ) 1) == pdTRUE) { // lock for reading
+			if (ControllerSetpoint.timestamp > 0 && xTaskGetTickCount() < (ControllerSetpoint.timestamp + 500)) { // 500 ms
+				ControllerSetpointLocal.setpoint = ControllerSetpoint.setpoint;
+				ControllerSetpointLocal.mode = ControllerSetpoint.AUTO;
+				ControllerSetpointLocal.timestamp = ControllerSetpoint.timestamp;
+			}
+			xSemaphoreGive( ControllerSetpoint.semaphore ); // give semaphore back
+		}
 
+		if (rc_throttle->isActive())
+		{
+			throttle_in = rc_throttle->Get(true);
+			steering_in = rc_steering->Get(true);
+
+			if (fabsf(throttle_in) < 0.05f && fabsf(steering_in) < 0.05f) {
+				RC_Active = true;
+			}
+
+			if (RC_Active && (ControllerSetpointLocal.mode == ControllerSetpoint.MANUAL
+			    || fabsf(throttle_in) > 0.05f || xTaskGetTickCount() > (ControllerSetpointLocal.timestamp + 200)))  // reference older than 200 ms or we need manual takeover
+			{
+				ControllerSetpointLocal.mode = ControllerSetpoint.MANUAL;
+				ControllerSetpointLocal.timestamp = xTaskGetTickCount();
+				ControllerSetpointLocal.setpoint.angular_velocity = 20*throttle_in;
+				ControllerSetpointLocal.setpoint.steering = steering_in;
+			}
+		} else { // RC inactive
+			RC_Active = false;
+			if (xTaskGetTickCount() > (ControllerSetpointLocal.timestamp + 100))  // reference timeout
+			{
+				ControllerSetpointLocal.mode = ControllerSetpoint.MANUAL;
+				ControllerSetpointLocal.timestamp = xTaskGetTickCount();
+				ControllerSetpointLocal.setpoint.angular_velocity = 0;
+				ControllerSetpointLocal.setpoint.steering = 0;
+			}
+		}
+
+		if (ControllerSetpointLocal.mode == ControllerSetpoint.MANUAL) {
+			// Red
+			red->Set(0.0);
+			green->Set(1.0);
+			blue->Set(1.0);
+		} else { // Auto
+			// Green
+			red->Set(1.0);
+			green->Set(0.0);
+			blue->Set(1.0);
+		}
+
+#if MOTOR_SYSID
 		if (steering_in < -0.7)
 			EnableTest = true;
 		else if (steering_in > 0.7) {
@@ -191,18 +287,28 @@ void MainTask(void * pvParameters)
 		}
 
 		throttle->Set(SpeedValue);
-		//controller->SetSpeed(10*throttle_in);
 		servo_front->Set(steering_in);
-
+#else
+		controller->SetSpeed(rateLimit(ControllerSetpointLocal.setpoint.angular_velocity));
+		servo_front->Set(ControllerSetpointLocal.setpoint.steering);
+#endif
 
 		lspc::MessageTypesToPC::Sensors_t msg;
 		msg.timestamp = microsTimer->GetTime();
-		msg.encoders.front = encoderFront;
-		msg.encoders.back = encoderBack;
+		msg.wheel_angles.front = 2.f * M_PI * (float)encoderFront / (ENCODER_TICKS_REV*GEAR_RATIO);
+		msg.wheel_angles.rear = 2.f * M_PI * (float)encoderBack / (ENCODER_TICKS_REV*GEAR_RATIO);
+		msg.wheel_angular_velocities.front = controller->SpeedFiltered; // OBS! This should be fixed such that we have both front and rear velocities
+		msg.wheel_angular_velocities.rear = controller->SpeedFiltered;
 		msg.rc.throttle = throttle_in;
 		msg.rc.steering = steering_in;
-		msg.motors.throttle = float(int16_t(1024*SpeedValue)) / 1024.f;
-		msg.motors.steering = float(int16_t(1024*steering_in)) / 1024.f;
+#if MOTOR_SYSID
+		msg.motor_outputs.throttle = float(int16_t(1024*SpeedValue)) / 1024.f; // quantize according to how the PWM output will be quantized
+#else
+		msg.motor_outputs.throttle = float(int16_t(1024*controller->MotorOutput)) / 1024.f;
+#endif
+		msg.motor_outputs.steering = float(int16_t(1024*steering_in)) / 1024.f;
+		msg.setpoints.angular_velocity = controller->SpeedSetpoint;
+		msg.setpoints.steering = steering_in;
 		lspcUSB->TransmitAsync(lspc::MessageTypesToPC::Sensors, (uint8_t *)&msg, sizeof(msg));
 
 		osDelay(50);
@@ -222,4 +328,34 @@ void EnterBootloader_Callback(void * param, const std::vector<uint8_t>& payload)
 	USBD_Stop(&USBCDC::hUsbDeviceFS);
 	USBD_DeInit(&USBCDC::hUsbDeviceFS);
 	Enter_DFU_Bootloader();
+}
+
+void SetPID_Callback(void * param, const std::vector<uint8_t>& payload)
+{
+	SpeedController * controller = (SpeedController *)param;
+	if (!controller) return;
+
+	volatile lspc::MessageTypesFromPC::SetPID_t msg;
+	if (payload.size() != sizeof(msg)) return;
+	memcpy((uint8_t *)&msg, payload.data(), sizeof(msg));
+
+	controller->SetPID(msg.P, msg.I, msg.D);
+}
+
+void Setpoint_Callback(void * param, const std::vector<uint8_t>& payload)
+{
+	ControllerSetpoint_t * ControllerSetpoint = (ControllerSetpoint_t *)param;
+	if (!ControllerSetpoint) return;
+
+	xSemaphoreTake( ControllerSetpoint->semaphore, ( TickType_t ) portMAX_DELAY); // lock for updating
+
+	volatile lspc::MessageTypesFromPC::Setpoint_t msg;
+	if (payload.size() != sizeof(msg)) return;
+	memcpy((uint8_t *)&msg, payload.data(), sizeof(msg));
+
+	ControllerSetpoint->timestamp = xTaskGetTickCount();
+	ControllerSetpoint->setpoint.angular_velocity = msg.angular_velocity;
+	ControllerSetpoint->setpoint.steering = msg.steering;
+
+	xSemaphoreGive( ControllerSetpoint->semaphore ); // give semaphore back
 }
